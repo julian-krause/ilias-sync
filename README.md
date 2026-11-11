@@ -18,7 +18,7 @@ Gebaut und getestet für das ILIAS der FH Münster (ILIAS 10, Anmeldung über Sh
 ## Installation
 
 ```bash
-git clone https://github.com/7nhnhktycf-sketch/ilias-sync.git ~/.claude/skills/ilias-sync
+git clone https://github.com/julian-krause/ilias-sync.git ~/.claude/skills/ilias-sync
 ```
 
 Danach in Claude Code `/ilias-sync` eingeben.
