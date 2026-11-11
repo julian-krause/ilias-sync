@@ -1,5 +1,7 @@
 .cookies.json
 .env
 .env.*
+!.env.example
+config.json
 __pycache__/
 .DS_Store

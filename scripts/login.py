@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """ILIAS-Login über Vercel agent-browser. Schreibt frische Cookies für ilias.py.
 
-Zugangsdaten: Umgebungsvariablen ILIAS_USER und ILIAS_PASSWORD, sonst aus
-~/.claude/skills/ilias-sync/.env (eine Zeile KEY=Wert je Variable, chmod 600).
-Das Skript gibt die Zugangsdaten nie aus.
+Zugangsdaten: Umgebungsvariablen ILIAS_USER und ILIAS_PASSWORD, sonst aus der Datei
+.env im Skill-Ordner (eine Zeile KEY=Wert je Variable, chmod 600; Vorlage: .env.example).
+Das Skript gibt die Zugangsdaten nie aus. Die ILIAS-Adresse kommt aus config.json
+(ilias_url, gesetzt mit `ilias.py setup --url ...`), Standard ist die FH Münster.
 
   login.py            anmelden (falls nötig), Cookies exportieren, Browser schließen
   login.py --keep     wie oben, Browser bleibt offen: agent-browser --session ilias ...
@@ -26,15 +27,28 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-SKILL = os.path.expanduser("~/.claude/skills/ilias-sync")
+SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV = os.path.join(SKILL, ".env")
+CONFIG = os.environ.get("ILIAS_SYNC_CONFIG", os.path.join(SKILL, "config.json"))
 COOKIES = os.environ.get("COOKIES", os.path.join(SKILL, ".cookies.json"))
-BASE = "https://ilias.fh-muenster.de/"
-ILIAS_HOST = "ilias.fh-muenster.de"
-IDP_HOST = "idp.fh-muenster.de"
+DEFAULT_URL = "https://ilias.fh-muenster.de/"
 SESSION = "ilias"
-PROFILE = "ilias-fh"
-LOGGED_IN = "!!document.querySelector('a[href*=doLogout]')"
+PROFILE = "ilias-sync"
+
+
+def base_url():
+    try:
+        url = json.load(open(CONFIG, encoding="utf-8")).get("ilias_url")
+    except (OSError, ValueError):
+        url = None
+    return (url or DEFAULT_URL).rstrip("/") + "/"
+
+
+BASE = base_url()
+ILIAS_HOST = urlsplit(BASE).hostname
+LOGGED_IN = "!!document.querySelector('a[href*=\"ogout\"]')"          # link „Abmelden“ (doLogout / logout)
+HAS_PASSWORD = "!!document.querySelector('input[type=password]')"
+SHIBBOLETH = "!!(document.querySelector('#username') && document.querySelector('#password'))"
 
 
 def stop(code, msg):
@@ -97,30 +111,37 @@ def mark():
     js("window.__iliasSync = 1")
 
 
+def logged_in():
+    return host() == ILIAS_HOST and bool(js(LOGGED_IN))
+
+
 def sign_in(user, pw):
-    ab("auth", "save", PROFILE, "--url", f"https://{IDP_HOST}/", "--username", user,
+    """Fill the login form on the current page (university login server or ILIAS itself)."""
+    selectors = []
+    if js(SHIBBOLETH):   # standard Shibboleth form; otherwise agent-browser finds the fields itself
+        selectors = ["--username-selector", "#username", "--password-selector", "#password"]
+        if js("!!document.querySelector('button[name=_eventId_proceed]')"):
+            selectors += ["--submit-selector", "button[name=_eventId_proceed]"]
+    ab("auth", "save", PROFILE, "--url", f"https://{host()}/", "--username", user,
        "--password-stdin", stdin=pw)
     try:
         mark()
-        ab("auth", "login", PROFILE, "--no-navigate", "--username-selector", "#username",
-           "--password-selector", "#password", "--submit-selector", "button[name=_eventId_proceed]")
+        ab("auth", "login", PROFILE, "--no-navigate", *selectors)
     finally:
         ab("auth", "delete", PROFILE, check=False)   # .env stays the only place with the password
     wait_new_page()
     for _ in range(6):
-        h = host()
-        if h == ILIAS_HOST:
+        if logged_in():
             return
-        if h == IDP_HOST:
-            if js("!!document.querySelector('#password')"):
-                why = js("(document.querySelector('.form-error, .error, [class*=error]')||{}).innerText || ''")
-                ab("close", check=False)
-                stop(4, f"LOGIN FAILED: Die FH hat Kennung oder Passwort abgelehnt. {str(why).strip()[:200]}")
-            if js("!!document.querySelector('[name=_eventId_proceed]')"):   # consent page
-                mark()
-                ab("click", "[name=_eventId_proceed]")
-                wait_new_page()
-                continue
+        if js(HAS_PASSWORD):   # the form is back: rejected
+            why = js("(document.querySelector('.form-error, .error, [class*=error], .alert')||{}).innerText || ''")
+            ab("close", check=False)
+            stop(4, f"LOGIN FAILED: Kennung oder Passwort wurden abgelehnt. {str(why).strip()[:200]}")
+        if host() != ILIAS_HOST and js("!!document.querySelector('[name=_eventId_proceed]')"):   # consent page
+            mark()
+            ab("click", "[name=_eventId_proceed]")
+            wait_new_page()
+            continue
         time.sleep(2)
     u = urlsplit(ab("get", "url").get("url", ""))
     stop(5, f"LOGIN STUCK: Seite „{ab('get', 'title').get('title', '')}“ ({u.hostname}{u.path}). "
@@ -146,7 +167,7 @@ def manual():
     print("Fenster ist offen, warte bis zu 5 Minuten auf die Anmeldung …", flush=True)
     end = time.time() + 300
     while time.time() < end:
-        if host() == ILIAS_HOST and js(LOGGED_IN):
+        if logged_in():
             return
         time.sleep(3)
     stop(4, "LOGIN FAILED: Im Fenster hat sich niemand angemeldet (5 Minuten gewartet).")
@@ -168,14 +189,14 @@ def main():
         manual()
     else:
         ab("open", BASE)
-        if host() == IDP_HOST:
+        if not logged_in() and js(HAS_PASSWORD):
             if not (user and pw):
                 ab("close", check=False)
                 stop(2, f"NO CREDENTIALS: ILIAS_USER/ILIAS_PASSWORD fehlen in {ENV}")
             sign_in(user, pw)
-        if not js(LOGGED_IN):
+        if not logged_in():
             ab("open", BASE)
-            if not js(LOGGED_IN):
+            if not logged_in():
                 stop(5, f"LOGIN STUCK: ILIAS zeigt keinen angemeldeten Nutzer. "
                         f"Browser bleibt offen: agent-browser --session {SESSION} snapshot -i")
 

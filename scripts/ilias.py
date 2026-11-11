@@ -3,35 +3,57 @@
 # requires-python = ">=3.10"
 # dependencies = ["requests", "beautifulsoup4"]
 # ///
-"""ILIAS (FH Münster) -> iCloud semester folder sync.
+"""ILIAS -> local semester folder sync.
 
-Run with:  uv run ~/.claude/skills/ilias-sync/scripts/ilias.py <command> ...
+Run with:  <skill>/scripts/ilias.py <command> ...
 
-Commands
-  inventory SEMDIR                 what already exists locally (+ manifest summary)
-  courses   [--match TEXT]         memberships grouped by ILIAS category (semester)
-  plan      SEMDIR REF=Folder ...  crawl the courses, write SEMDIR/.ilias-plan.json, print what is new
-  download  SEMDIR                 download everything new from the plan (skips known/duplicate files)
-  mv        SEMDIR OLD NEW         rename/move a folder inside SEMDIR and remember it for future runs
-  dupes     SEMDIR                 list files with identical content
+Setup (once per machine / semester)
+  config                              show the settings, or "SETUP NEEDED" before the first setup
+  setup [SEMDIR] [--category TEXT] [--url ILIAS_URL]
+                                      save target folder, semester category and ILIAS address
+  select SEMDIR [REF=Folder ...] [--ignore REF ...]
+                                      choose which courses are synced; ignored ones are never asked again
 
-State lives in SEMDIR/.ilias-sync.json (manifest). Cookies come from COOKIES (default
-~/.claude/skills/ilias-sync/.cookies.json), written by scripts/login.py (agent-browser).
+Sync
+  inventory SEMDIR                    what already exists locally (+ manifest summary)
+  courses  [--match TEXT | --current] memberships grouped by ILIAS category (semester);
+                                      --current = configured category, marks each course and lists NEW ones
+  plan     SEMDIR [REF=Folder ...]    crawl the courses (default: all selected ones), write
+                                      SEMDIR/.ilias-plan.json, print what is new
+  download SEMDIR                     download everything new from the plan (skips known/duplicate files)
+  mv       SEMDIR OLD NEW             rename/move a folder inside SEMDIR and remember it for future runs
+  dupes    SEMDIR                     list files with identical content
+
+State: <skill>/config.json (settings of this machine), SEMDIR/.ilias-sync.json (manifest: selected and
+ignored courses, renamed folders, downloaded files). Cookies come from <skill>/.cookies.json, written
+by scripts/login.py (agent-browser).
 """
 import hashlib, json, os, re, shutil, sys, tempfile
-from urllib.parse import urljoin, unquote
+from urllib.parse import urljoin, unquote, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
 
-BASE = "https://ilias.fh-muenster.de/"
-COOKIES = os.environ.get("COOKIES", os.path.expanduser("~/.claude/skills/ilias-sync/.cookies.json"))
+SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG = os.environ.get("ILIAS_SYNC_CONFIG", os.path.join(SKILL, "config.json"))
+COOKIES = os.environ.get("COOKIES", os.path.join(SKILL, ".cookies.json"))
+DEFAULT_URL = "https://ilias.fh-muenster.de/"
+
+
+def load_config():
+    try:
+        return json.load(open(CONFIG, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+BASE = (load_config().get("ilias_url") or DEFAULT_URL).rstrip("/") + "/"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
 SKIP_NAMES = {".DS_Store", ".ilias-sync.json", ".ilias-plan.json"}
 DATALESS = 0x40000000  # macOS SF_DATALESS (iCloud file not downloaded)
 SKIP_DIRS = {".venv", "node_modules", ".git", "__pycache__", ".ipynb_checkpoints"}
 TIMEOUT = (10, 60)  # Sekunden für Verbindungsaufbau und Antwort; ohne Grenze hängt der Sync, wenn ILIAS nicht antwortet
-NETWORK_HINT = "NETWORK: ILIAS ist nicht erreichbar ({}). Störung bei der FH oder keine Verbindung – später erneut versuchen."
+NETWORK_HINT = "NETWORK: ILIAS ist nicht erreichbar ({}). Störung bei der Hochschule oder keine Verbindung – später erneut versuchen."
 
 
 # ---------- helpers ----------
@@ -43,6 +65,8 @@ class TimeoutSession(requests.Session):
 
 def session():
     s = TimeoutSession()
+    if not os.path.exists(COOKIES):
+        sys.exit("SESSION EXPIRED: no cookies yet, run scripts/login.py first.")
     s.cookies.update(json.load(open(COOKIES)))
     s.headers["User-Agent"] = UA
     return s
@@ -51,7 +75,8 @@ def session():
 def get_soup(s, url):
     r = s.get(url)
     anon = "nicht in ILIAS eingeloggt" in r.text or "logout" not in r.text.lower()
-    if anon or "idp.fh-muenster.de" in r.url or "cmd=showLogin" in r.url or "ilstartupgui" in r.url.lower():
+    elsewhere = urlsplit(r.url).hostname != urlsplit(BASE).hostname   # redirected to the login server
+    if anon or elsewhere or "cmd=showLogin" in r.url or "ilstartupgui" in r.url.lower():
         sys.exit("SESSION EXPIRED: run scripts/login.py for fresh cookies, then retry.")
     return BeautifulSoup(r.text, "html.parser")
 
@@ -69,6 +94,11 @@ def sha256(path):
     return h.hexdigest()
 
 
+def dataless(path):
+    """True for an iCloud placeholder (macOS only; other systems have no st_flags)."""
+    return bool(getattr(os.stat(path), "st_flags", 0) & DATALESS)
+
+
 def walk(root):
     for dp, dns, fns in os.walk(root):
         dns[:] = [d for d in dns if d not in SKIP_DIRS]
@@ -79,7 +109,11 @@ def walk(root):
 
 def load_manifest(semdir):
     p = os.path.join(semdir, ".ilias-sync.json")
-    return json.load(open(p)) if os.path.exists(p) else {"courses": {}, "files": {}}
+    m = json.load(open(p)) if os.path.exists(p) else {}
+    m.setdefault("courses", {})   # selected: ref -> {folder, renames, title}
+    m.setdefault("files", {})     # downloaded: file ref -> path relative to SEMDIR
+    m.setdefault("ignored", {})   # deselected: ref -> {title, folder?, renames?}
+    return m
 
 
 def save_manifest(semdir, m):
@@ -123,20 +157,138 @@ def cmd_inventory(semdir):
     print(f"MANIFEST courses={len(m['courses'])} known_files={len(m['files'])}")
     for ref, c in m["courses"].items():
         print(f"  {ref} -> {c['folder']}  renames={c.get('renames', {})}")
+    for ref, c in m["ignored"].items():
+        print(f"  {ref} ignored  {c.get('title', '')}")
 
 
-def cmd_courses(match=None):
+def fetch_courses(match=None):
+    """Course memberships as [(category, ref, title)], optionally only categories containing `match`."""
     soup = get_soup(session(), BASE + "ilias.php?baseClass=ilmembershipoverviewgui")
+    found = []
     for g in soup.select("div.il-item-group"):
         h = g.find("h3").get_text(strip=True)
         if match and match.lower() not in h.lower():
             continue
-        items = [(a.get_text(strip=True), a["href"]) for a in g.select("h4.il-item-title a[href]")]
-        crs = [(t, re.search(r"/go/crs/(\d+)", u).group(1)) for t, u in items if "/go/crs/" in u]
-        if crs:
-            print(f"## {h}")
-            for t, ref in crs:
-                print(f"  {ref}  {t}")
+        for a in g.select("h4.il-item-title a[href]"):
+            hit = re.search(r"/go/crs/(\d+)", a["href"])
+            if hit:
+                found.append((h, hit.group(1), a.get_text(strip=True)))
+    return found
+
+
+def cmd_courses(match=None, current=False):
+    cfg = load_config()
+    if current:
+        if not cfg.get("category") or not cfg.get("semdir"):
+            sys.exit(SETUP_NEEDED)
+        match = cfg["category"]
+    found = fetch_courses(match)
+    m = load_manifest(cfg["semdir"]) if cfg.get("semdir") else None
+    mine = (cfg.get("category") or "").lower()
+    new, last = [], None
+    for cat, ref, title in found:
+        if cat != last:
+            print(f"## {cat}")
+            last = cat
+        mark = ""
+        if m is not None and mine and mine in cat.lower():
+            if ref in m["courses"]:
+                mark = f"   [sync -> {m['courses'][ref]['folder']}]"
+            elif ref in m["ignored"]:
+                mark = "   [ignoriert]"
+            else:
+                mark = "   [NEU]"
+                new.append(ref)
+        print(f"  {ref}  {title}{mark}")
+    if current:
+        here = {ref for _, ref, _ in found}
+        for ref, c in m["courses"].items():
+            if ref not in here:
+                print(f"GONE {ref} ({c['folder']}): nicht mehr unter den Mitgliedschaften des Semesters")
+        print(f"NEW {len(new)}" + (": " + " ".join(new) if new else ""))
+
+
+SETUP_NEEDED = "SETUP NEEDED: Zielordner und Semester sind noch nicht festgelegt (Ersteinrichtung, siehe SKILL.md Schritt 0)."
+
+
+def cmd_config():
+    cfg = load_config()
+    if not cfg.get("semdir") or not cfg.get("category"):
+        sys.exit(SETUP_NEEDED)
+    semdir = cfg["semdir"]
+    m = load_manifest(semdir) if os.path.isdir(semdir) else {"courses": {}, "ignored": {}}
+    print(f"ILIAS     {BASE}")
+    print(f"SEMDIR    {semdir}" + ("" if os.path.isdir(semdir) else "   (Ordner fehlt!)"))
+    print(f"CATEGORY  {cfg['category']}")
+    print(f"COURSES   {len(m['courses'])} werden synchronisiert, {len(m['ignored'])} abgewählt")
+    for ref, c in m["courses"].items():
+        print(f"  {ref} -> {c['folder']}" + (f"   ({c['title']})" if c.get("title") else ""))
+    for ref, c in m["ignored"].items():
+        print(f"  {ref} abgewählt   ({c.get('title', '')})")
+    if not m["courses"]:
+        print("NO COURSES: noch keine Kurse ausgewählt (select).")
+
+
+def cmd_setup(args):
+    cfg = load_config()
+    i = 0
+    while i < len(args):
+        if args[i] in ("--category", "--url") and i + 1 < len(args):
+            cfg["category" if args[i] == "--category" else "ilias_url"] = args[i + 1].strip()
+            i += 2
+        elif not args[i].startswith("--") and i == 0:
+            cfg["semdir"] = os.path.abspath(os.path.expanduser(args[i]))
+            os.makedirs(cfg["semdir"], exist_ok=True)
+            i += 1
+        else:
+            sys.exit(__doc__)
+    if cfg.get("ilias_url"):
+        if not cfg["ilias_url"].startswith("http"):
+            sys.exit("--url needs the full address, e.g. https://ilias.example.org/")
+        cfg["ilias_url"] = cfg["ilias_url"].rstrip("/") + "/"
+    json.dump(cfg, open(CONFIG, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    for k in ("ilias_url", "semdir", "category"):
+        print(f"{k}: {cfg.get(k) or ('(Standard) ' + DEFAULT_URL if k == 'ilias_url' else '(offen)')}")
+
+
+def cmd_select(semdir, args):
+    """Add courses (REF=Folder) and/or deselect them (--ignore REF ...). Files on disk are never touched."""
+    m = load_manifest(semdir)
+    try:
+        titles = {ref: title for _, ref, title in fetch_courses()}
+    except SystemExit:   # no valid session: selection still works, only the titles are missing
+        titles = {}
+    ignore = False
+    for a in args:
+        if a == "--ignore":
+            ignore = True
+        elif ignore:
+            if not a.isdigit():
+                sys.exit(f"--ignore expects course refs, got: {a}")
+            old = m["courses"].pop(a, {})
+            entry = {**m["ignored"].get(a, {}), **old}
+            entry["title"] = titles.get(a) or entry.get("title", "")
+            m["ignored"][a] = entry
+            print(f"ignored  {a}  {entry['title']}")
+        else:
+            ref, _, folder = a.partition("=")
+            folder = folder.strip().strip("/")
+            if not ref.isdigit() or not folder:
+                sys.exit(f"expected REF=Folder, got: {a}")
+            back = m["ignored"].pop(ref, {})
+            if ref in m["courses"]:
+                if m["courses"][ref]["folder"] != folder:
+                    sys.exit(f"{ref} is already synced to '{m['courses'][ref]['folder']}'. Rename folders with: mv")
+            elif back.get("folder") == folder:   # re-selected: keep the remembered renames
+                m["courses"][ref] = {"folder": folder, "renames": back.get("renames", {})}
+            else:
+                m["courses"][ref] = {"folder": folder, "renames": {}}
+            if titles.get(ref) or back.get("title"):
+                m["courses"][ref]["title"] = titles.get(ref) or back["title"]
+            print(f"sync     {ref} -> {folder}  {m['courses'][ref].get('title', '')}")
+    os.makedirs(semdir, exist_ok=True)
+    save_manifest(semdir, m)
+    print(f"{len(m['courses'])} courses synced, {len(m['ignored'])} ignored")
 
 
 def crawl(s, url, path, out, seen):
@@ -177,8 +329,12 @@ def cmd_plan(semdir, pairs):
     for p in pairs:
         ref, folder = p.split("=", 1)
         m["courses"].setdefault(ref, {"folder": folder, "renames": {}})
+        m["ignored"].pop(ref, None)
+    refs = [p.split("=", 1)[0] for p in pairs] or list(m["courses"])
+    if not refs:
+        sys.exit("NO COURSES: nothing selected yet. Choose courses first: select SEMDIR REF=Folder ...")
     plan = {}
-    for ref in [p.split("=", 1)[0] for p in pairs]:
+    for ref in refs:
         out = {"files": [], "other": []}
         crawl(s, f"{BASE}go/crs/{ref}", [], out, {("crs", ref)})
         plan[ref] = out
@@ -205,7 +361,7 @@ def cmd_download(semdir):
     def hash_index():
         if not hashes:
             for f in existing:
-                if os.stat(f).st_flags & DATALESS:  # iCloud placeholder: reading would force a download
+                if dataless(f):  # iCloud placeholder: reading would force a download
                     continue
                 try:
                     hashes.setdefault(sha256(f), f)
@@ -246,7 +402,7 @@ def cmd_download(semdir):
                 digest = sha256(tmp.name)
                 cdir = os.path.join(semdir, course["folder"])
                 # iCloud placeholders cannot be hashed without downloading them; same size in the same course counts as duplicate
-                ph = [e for e in existing if e.startswith(cdir + os.sep) and os.stat(e).st_flags & DATALESS and os.path.getsize(e) == os.path.getsize(tmp.name)]
+                ph = [e for e in existing if e.startswith(cdir + os.sep) and dataless(e) and os.path.getsize(e) == os.path.getsize(tmp.name)]
                 if ph:
                     os.unlink(tmp.name)
                     m["files"][f["ref"]] = os.path.relpath(ph[0], semdir)
@@ -326,7 +482,7 @@ def cmd_mv(semdir, old, new):
 def cmd_dupes(semdir):
     seen = {}
     for f in walk(semdir):
-        if os.stat(f).st_flags & DATALESS:
+        if dataless(f):
             continue
         seen.setdefault((os.path.getsize(f), sha256(f)), []).append(os.path.relpath(f, semdir))
     groups = [v for v in seen.values() if len(v) > 1]
@@ -342,7 +498,10 @@ if __name__ == "__main__":
     c = a[0]
     try:
         if c == "inventory": cmd_inventory(a[1])
-        elif c == "courses": cmd_courses(a[2] if len(a) > 2 and a[1] == "--match" else None)
+        elif c == "config": cmd_config()
+        elif c == "setup": cmd_setup(a[1:])
+        elif c == "select": cmd_select(a[1], a[2:])
+        elif c == "courses": cmd_courses(a[2] if len(a) > 2 and a[1] == "--match" else None, current="--current" in a)
         elif c == "plan": cmd_plan(a[1], a[2:])
         elif c == "download": cmd_download(a[1])
         elif c == "mv": cmd_mv(a[1], a[2], a[3])
